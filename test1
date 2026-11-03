@@ -1,0 +1,148 @@
+import com.microsoft.playwright.Browser;
+import com.microsoft.playwright.BrowserContext;
+import com.microsoft.playwright.Locator;
+import com.microsoft.playwright.Page;
+import com.microsoft.playwright.Playwright;
+import com.microsoft.playwright.options.LoadState;
+
+import java.nio.file.Paths;
+
+/**
+ * One-time login for YOUR flow: app -> "Sign in with Okta" button ->
+ * email -> Next -> Okta Verify Push with number matching on your phone.
+ *
+ * The push step itself is NOT automated and cannot be: the approval
+ * happens on your phone, outside the browser. This script does
+ * everything up to the push, then WAITS for you to tap the matching
+ * number on your phone, and only then saves the session.
+ *
+ * Run this ONCE per session expiry, never in every test:
+ *   APP_URL=https://your-app.com TEST_USER=you@company.com java OktaPushAuthSetup
+ *
+ * It runs HEADED (visible browser) on purpose, so you can see the
+ * Okta button and the email screen. After it saves auth.json, all
+ * normal tests run headless from OktaBaseTest.
+ *
+ * Secrets: TEST_USER comes from an environment variable only.
+ * Never commit auth.json (add it to .gitignore) — it holds live
+ * session cookies.
+ *
+ * Maven (add to pom.xml):
+ *   <dependency>
+ *     <groupId>com.microsoft.playwright</groupId>
+ *     <artifactId>playwright</artifactId>
+ *     <version>1.49.0</version>
+ *   </dependency>
+ *
+ * This does NOT automate a real PIV card. If your app ever switches
+ * to PIV-only, this flow does not apply — PIV stays a manual check.
+ */
+public class OktaPushAuthSetup {
+
+    private static final String APP_URL = env("APP_URL", "https://your-app.com");
+    private static final String TEST_USER = env("TEST_USER", "");
+    private static final String AUTH_FILE = env("AUTH_FILE", "auth.json");
+
+    public static void main(String[] args) {
+        try (Playwright playwright = Playwright.create()) {
+            Browser browser = playwright.chromium().launch(
+                    new Browser.LaunchOptions().setHeadless(false));
+            BrowserContext context = browser.newContext();
+            Page page = context.newPage();
+
+            // Step 1: Open the app link.
+            page.navigate(APP_URL);
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+
+            // Step 2: Click the Okta button — but only if it is there.
+            // Some apps redirect straight to Okta, in which case this
+            // step is skipped and nothing breaks.
+            clickIfVisible(page,
+                    "button:has-text('Okta')",
+                    "a:has-text('Okta')",
+                    "button:has-text('Sign in with Okta')",
+                    "text=Sign in with Okta");
+
+            // Step 3: Fill your email and click Next.
+            // Identity Engine uses identifier, Classic uses username.
+            fillFirstVisible(page, TEST_USER,
+                    "input[name='identifier']",
+                    "input[name='username']",
+                    "input[type='email']");
+            clickFirstVisible(page,
+                    "input[type='submit']",
+                    "button:has-text('Next')",
+                    "button:has-text('Sign In')");
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+
+            // Step 4: THE PUSH — this is YOUR step, not the script's.
+            // Okta now shows a number on the computer screen and sends
+            // a push to your phone. Tap the matching number on your
+            // phone. The script below just waits (up to 3 minutes)
+            // for Okta to send you back to the app.
+            System.out.println(">>> Approve the push on your phone now: "
+                    + "tap the number that matches the screen. Waiting...");
+            page.waitForURL(url -> !url.contains("okta.com")
+                    && !url.contains("okta-emea.com"),
+                    new Page.WaitForURLOptions().setTimeout(180000));
+            page.waitForLoadState(LoadState.NETWORKIDLE);
+
+            // Step 5: Save everything — Okta cookies + app cookies
+            // + localStorage. Plain cookie export misses localStorage;
+            // storageState does not.
+            context.storageState(new BrowserContext.StorageStateOptions()
+                    .setPath(Paths.get(AUTH_FILE)));
+            System.out.println("Saved logged-in state to " + AUTH_FILE);
+            System.out.println("Now run your tests from OktaBaseTest — "
+                    + "no Okta button, no email, no phone push until this expires.");
+            browser.close();
+        }
+    }
+
+    private static void fillFirstVisible(Page page, String value, String... selectors) {
+        Locator field = firstVisible(page, selectors);
+        if (field == null) {
+            throw new IllegalStateException(
+                    "No email field matched. Inspect your Okta page and add its selector. Tried: "
+                            + String.join(", ", selectors));
+        }
+        field.fill(value);
+    }
+
+    private static Locator firstVisible(Page page, String... selectors) {
+        for (String selector : selectors) {
+            Locator locator = page.locator(selector).first();
+            try {
+                if (locator.isVisible()) {
+                    return locator;
+                }
+            } catch (Exception ignored) {
+                // Not on this page — try the next selector.
+            }
+        }
+        return null;
+    }
+
+    private static void clickFirstVisible(Page page, String... selectors) {
+        Locator button = firstVisible(page, selectors);
+        if (button == null) {
+            throw new IllegalStateException(
+                    "No button matched. Inspect the page and add its selector. Tried: "
+                            + String.join(", ", selectors));
+        }
+        button.click();
+    }
+
+    private static void clickIfVisible(Page page, String... selectors) {
+        Locator button = firstVisible(page, selectors);
+        if (button != null) {
+            button.click();
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+        }
+    }
+
+    private static String env(String name, String fallback) {
+        String value = System.getenv(name);
+        return (value == null || value.isBlank()) ? fallback : value;
+    }
+}
